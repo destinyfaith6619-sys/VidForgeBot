@@ -4,6 +4,7 @@ import re
 import asyncio
 import aiohttp
 from datetime import datetime
+from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -16,7 +17,7 @@ if not BOT_TOKEN:
 REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
 HUGGINGFACE_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN")
 
-# Check if Replicate is available
+# Check if APIs are available
 REPLICATE_AVAILABLE = bool(REPLICATE_API_TOKEN)
 
 # User sessions
@@ -25,16 +26,16 @@ video_history = {}
 
 # ==================== VIDEO GENERATION FUNCTIONS ====================
 
-async def generate_video_replicate(prompt: str, duration: int = 3):
+async def generate_video_replicate(prompt: str):
     """Generate video using Replicate API"""
     if not REPLICATE_AVAILABLE:
-        return None
+        return None, None
     
     try:
         import replicate
         
-        # Use Stable Video Diffusion model
-        # This generates a short video from text prompt
+        # Use Stable Video Diffusion model for text-to-video
+        # This is a free model on Replicate
         output = replicate.run(
             "stability-ai/stable-video-diffusion:3f0457e4619daac51203dedb472816fd4af51f3149fa7a9e0b5ffcf1b8172438",
             input={
@@ -50,23 +51,31 @@ async def generate_video_replicate(prompt: str, duration: int = 3):
         
         # Replicate returns a URL or file
         if output:
+            # If output is a list (multiple outputs), get the first one
+            if isinstance(output, list) and len(output) > 0:
+                video_url = output[0]
+            elif isinstance(output, str):
+                video_url = output
+            else:
+                return None, None
+            
             # Download the video
             async with aiohttp.ClientSession() as session:
-                async with session.get(output, timeout=60) as response:
+                async with session.get(video_url, timeout=120) as response:
                     if response.status == 200:
-                        return await response.read()
-        return None
+                        return await response.read(), "Replicate AI"
+        return None, None
     except Exception as e:
         print(f"Replicate video generation error: {e}")
-        return None
+        return None, None
 
 async def generate_video_huggingface(prompt: str):
     """Generate video using HuggingFace API"""
     if not HUGGINGFACE_API_TOKEN:
-        return None
+        return None, None
     
     try:
-        # Use HuggingFace's diffusers video generation
+        # Use HuggingFace's inference API
         API_URL = "https://api-inference.huggingface.co/models/ali-vilab/text-to-video-ms-1.7b"
         headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
         
@@ -81,22 +90,29 @@ async def generate_video_huggingface(prompt: str):
         async with aiohttp.ClientSession() as session:
             async with session.post(API_URL, json=payload, headers=headers, timeout=120) as response:
                 if response.status == 200:
-                    return await response.read()
+                    return await response.read(), "HuggingFace AI"
                 else:
                     print(f"HuggingFace API error: {response.status}")
-                    return None
+                    return None, None
     except Exception as e:
         print(f"HuggingFace video generation error: {e}")
-        return None
+        return None, None
 
-async def generate_video_fallback(prompt: str):
-    """Generate a video using free alternative (image sequence)"""
+async def generate_animated_gif(prompt: str):
+    """Generate an animated GIF from multiple AI-generated images (FREE fallback)"""
     try:
-        # Generate multiple frames using Pollinations.ai
         frames = []
+        variations = [
+            "wide shot",
+            "close up",
+            "panning left",
+            "panning right",
+            "zoom in"
+        ]
+        
         for i in range(5):
-            frame_prompt = f"{prompt}, frame {i+1}, smooth animation"
-            url = f"https://image.pollinations.ai/prompt/{frame_prompt.replace(' ', '%20')}?width=512&height=512&nologo=true"
+            frame_prompt = f"{prompt}, {variations[i]}, high quality, detailed, cinematic"
+            url = f"https://image.pollinations.ai/prompt/{frame_prompt.replace(' ', '%20')}?width=512&height=512&nologo=true&seed={i+100}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=30) as response:
@@ -105,16 +121,11 @@ async def generate_video_fallback(prompt: str):
             await asyncio.sleep(1)
         
         if frames:
-            # Create a simple animated GIF from frames
-            from PIL import Image
-            import io
-            
             images = []
             for frame_data in frames:
                 img = Image.open(io.BytesIO(frame_data))
                 images.append(img)
             
-            # Save as animated GIF
             output = io.BytesIO()
             images[0].save(
                 output,
@@ -122,33 +133,34 @@ async def generate_video_fallback(prompt: str):
                 save_all=True,
                 append_images=images[1:],
                 duration=500,
-                loop=0
+                loop=0,
+                optimize=False
             )
             output.seek(0)
-            return output.read()
-        return None
+            return output.read(), "AI Animation (GIF)"
+        return None, None
     except Exception as e:
-        print(f"Fallback video generation error: {e}")
-        return None
+        print(f"GIF generation error: {e}")
+        return None, None
 
 async def generate_video(prompt: str):
     """Generate video using available API"""
     # Try Replicate first if available
     if REPLICATE_AVAILABLE:
-        video = await generate_video_replicate(prompt)
+        video, engine = await generate_video_replicate(prompt)
         if video:
-            return video, "Replicate AI"
+            return video, engine
     
     # Try HuggingFace if available
     if HUGGINGFACE_API_TOKEN:
-        video = await generate_video_huggingface(prompt)
+        video, engine = await generate_video_huggingface(prompt)
         if video:
-            return video, "HuggingFace AI"
+            return video, engine
     
-    # Fallback to image-to-GIF animation
-    video = await generate_video_fallback(prompt)
+    # Fallback to animated GIF (100% free)
+    video, engine = await generate_animated_gif(prompt)
     if video:
-        return video, "AI Animation (GIF)"
+        return video, engine
     
     return None, None
 
@@ -168,6 +180,25 @@ def detect_video_type(prompt: str):
         return "Cartoon"
     else:
         return "General"
+
+# ==================== IMAGE GENERATION ====================
+async def generate_image(prompt: str, size: str = "512x512"):
+    """Generate an image using Pollinations.ai (FREE)"""
+    try:
+        clean_prompt = prompt.strip().replace(" ", "%20")
+        width, height = size.split("x")
+        
+        url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width={width}&height={height}&nologo=true&seed={int(datetime.now().timestamp())}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=30) as response:
+                if response.status == 200:
+                    return await response.read()
+                else:
+                    return None
+    except Exception as e:
+        print(f"Image generation error: {e}")
+        return None
 
 # ==================== KEYBOARD FUNCTIONS ====================
 def get_main_keyboard():
@@ -221,7 +252,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_history[user_id] = []
     
     # Check video generation status
-    video_status = "✅ Replicate AI" if REPLICATE_AVAILABLE else "⚠️ Limited (GIF animation)"
+    if REPLICATE_AVAILABLE:
+        video_status = "✅ Replicate AI (Premium)"
+    elif HUGGINGFACE_API_TOKEN:
+        video_status = "✅ HuggingFace AI"
+    else:
+        video_status = "🔄 AI Animation (GIF)"
     
     welcome_message = (
         f"🎬 Welcome {user.first_name} to **VidForgeBot**!\n\n"
@@ -229,12 +265,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**✨ Features:**\n"
         "• 🎬 Generate REAL videos from text prompts\n"
         "• 🖼️ Generate images from text descriptions\n"
-        "• 🎯 Multiple video styles (Nature, Urban, Fantasy, Space, Cartoon)\n"
+        "• 🎯 Multiple video styles\n"
         "• 📋 View generation history\n\n"
         f"**⚡ Video Engine:** {video_status}\n\n"
         "**🎯 Quick Start:**\n"
         "• Click 'Generate Video' and enter a description\n"
-        "• Choose a video style or use auto-detect\n\n"
+        "• Get AI-generated video in 30-60 seconds\n\n"
         "**📝 Example Prompts:**\n"
         "• 'A beautiful sunset over mountains'\n"
         "• 'Futuristic city with flying cars'\n"
@@ -267,9 +303,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• **Fantasy:** Dragons, castles, magic\n"
         "• **Space:** Galaxies, planets, astronauts\n"
         "• **Cartoon:** Animated characters, scenes\n\n"
-        "**⚠️ Note:**\n"
+        "**💡 Tips:**\n"
+        "• Be descriptive for better results\n"
         "• Videos take 30-60 seconds to generate\n"
-        "• Add REPLICATE_API_TOKEN for better quality\n\n"
+        "• Add REPLICATE_API_TOKEN for premium quality\n\n"
         "**Commands**\n"
         "/start - Start the bot\n"
         "/help - Show this help"
@@ -280,25 +317,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
-
-# ==================== IMAGE GENERATION ====================
-async def generate_image(prompt: str, size: str = "512x512"):
-    """Generate an image using Pollinations.ai"""
-    try:
-        clean_prompt = prompt.strip().replace(" ", "%20")
-        width, height = size.split("x")
-        
-        url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width={width}&height={height}&nologo=true&seed={int(datetime.now().timestamp())}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as response:
-                if response.status == 200:
-                    return await response.read()
-                else:
-                    return None
-    except Exception as e:
-        print(f"Image generation error: {e}")
-        return None
 
 # ==================== CALLBACK HANDLERS ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,7 +440,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         processing_msg = await update.message.reply_text(
             "🎬 **Generating video...**\n\n"
             "⏳ This may take 30-60 seconds...\n"
-            f"📝 Prompt: {text}",
+            f"📝 Prompt: {text}\n\n"
+            "🔄 Processing your request...",
             parse_mode="Markdown"
         )
         
@@ -535,6 +554,7 @@ def main():
     print("🎬 Starting VidForgeBot...")
     print(f"⚡ Replicate API: {'✅ Available' if REPLICATE_AVAILABLE else '❌ Not configured'}")
     print(f"⚡ HuggingFace API: {'✅ Available' if HUGGINGFACE_API_TOKEN else '❌ Not configured'}")
+    print("🔄 Fallback: AI Animation (GIF)")
     print("🖼️ Ready to generate videos and images!")
     print("=" * 50)
     
